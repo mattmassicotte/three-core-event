@@ -1,0 +1,42 @@
+include "stdlib.h"
+include "three/c11/threads.h"
+
+public
+import Monitor
+
+namespace Core::Event
+
+  public
+  struct Source
+    Core::Event::Type type
+    Natural descriptor
+    Natural registration
+  end
+
+  private
+  *Core::Event::Monitor shared_monitor = null
+
+  def initialize_shared_monitor()
+    shared_monitor = Core::Event::monitor_create()
+  end
+
+  public
+  def source_create(Core::Event::Type type, Natural descriptor; *Source)
+    // TODO: needs to be a once function
+    if shared_monitor == null
+      Core::Event::initialize_shared_monitor()
+    end
+
+    *Source source = malloc(sizeof(Source))
+
+    source->type = type
+    source->descriptor = descriptor
+
+    return source
+  end
+
+  def Source.set_handler({Natural descriptor, Natural data} closure)
+    self->registration = shared_monitor.watch(self->type, self->descriptor, closure)
+  end
+
+end
