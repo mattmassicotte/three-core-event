@@ -3,49 +3,50 @@ include "stdlib.h"
 include "string.h"
 include "fcntl.h"
 include "sys/event.h"
+include "errno.h"
 include "three/c11/threads.h"
 include "three/runtime/closure.h" // this should not be necessary
 
 namespace Core::Event
 
-    public
-    enum Type
-        Read
-        Write
+  public
+  enum Type
+    Read
+    Write
+  end
+
+  struct Monitor
+    thrd_t thread
+    Int    kq
+    *{Natural descriptor, Natural data} closure_ptr
+  end
+
+  private
+  def event_thread_entry(*Void arg; Int)
+    *Monitor monitor = arg
+    kevent64_s ke
+
+    loop
+      memset(&ke, 0, sizeof(kevent64_s))
+
+      Int result = kevent64(monitor->kq, null, 0, &ke, 1, 0, null)
+
+      // EV_EOF 0x8000
+      if ke.data == 0 && ke.flags & 0x8000
+        // TODO: It is completely wrong for this thread to exit
+        printf("WARN: kqueue thread exiting\n")
+        return 1
+      end
+
+      printf("woke for data: %lld flags: %x\n", ke.data, ke.flags)
+
+      if monitor->closure_ptr
+        (*monitor->closure_ptr)(ke.ident, ke.data)
+      end
     end
 
-    struct Monitor
-        thrd_t thread
-        Int    kq
-        *{Natural descriptor, Natural data} closure_ptr
-    end
-
-    private
-    def event_thread_entry(*Void arg; Int)
-        *Monitor monitor = arg
-        kevent64_s ke
-
-        loop
-            memset(&ke, 0, sizeof(kevent64_s))
-
-            Int result = kevent64(monitor->kq, null, 0, &ke, 1, 0, null)
-
-            // EV_EOF 0x8000
-            if ke.data == 0 && ke.flags & 0x8000
-                // TODO: It is completely wrong for this thread to exit
-                printf("WARN: kqueue thread exiting\n")
-                return 1
-            end
-
-            printf("woke for data: %lld flags: %x\n", ke.data, ke.flags)
-
-            if monitor->closure_ptr
-                (*monitor->closure_ptr)(ke.ident, ke.data)
-            end
-        end
-
-        return 0
-    end
+    return 0
+  end
 
   public
   def monitor_create(; *Monitor)
@@ -60,39 +61,45 @@ namespace Core::Event
     return monitor
   end
 
-    def prepare_descriptor(Natural descriptor)
-        // F_SETFL 4
-        // O_NONBLOCK 0x0004
-        if fcntl(descriptor, 4, 0x0004) == -1
-            printf("Unable to make descriptor non-blocking\n")
-        end
+  def prepare_descriptor(Natural descriptor)
+    // F_SETFL 4
+    // O_NONBLOCK 0x0004
+    if fcntl(descriptor, 4, 0x0004) == -1
+      printf("Unable to make descriptor non-blocking\n")
+    end
+  end
+
+  def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; Natural)
+    kevent64_s ke
+
+    memset(&ke, 0, sizeof(kevent64_s))
+
+    ke.ident = descriptor
+    switch type
+    case Core::Event::Type::Read
+      Core::Event::prepare_descriptor(descriptor)
+      ke.filter = -1 // EVFILT_READ
+      ke.flags = 0x0001 | 0x0004 // EV_ADD | EV_ENABLE
+    case Core::Event::Type::Write
+      Core::Event::prepare_descriptor(descriptor)
+      ke.filter = -2 // EVFILT_WRITE
+      ke.flags = 0x0001 | 0x0004 // EV_ADD | EV_ENABLE
     end
 
-    def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; Natural)
-        kevent64_s ke
-
-        memset(&ke, 0, sizeof(kevent64_s))
-
-        ke.ident = descriptor
-        switch type
-        case Core::Event::Type::Read
-            Core::Event::prepare_descriptor(descriptor)
-            ke.filter = -1 // EVFILT_READ
-            ke.flags = 0x0001 | 0x0004 // EV_ADD | EV_ENABLE
-            ke.data = 5
-        end
-
-        if kevent64(self->kq, &ke, 1, null, 0, 0, null) == -1
-            printf("Unable to arm the event\n")
-            return 0
-        end
-
-        // TODO: this is definitely not right.  We need to store these closures
-        // per-type and per-descriptor
-        printf("making a copy for monitor\n")
-        self->closure_ptr = three_closure_copy(closure)
-
-        return 1
+    if kevent64(self->kq, &ke, 1, null, 0, 0, null) == -1
+      printf("Unable to arm the event %d\n", (*__error()))
+      return 0
     end
+
+    // TODO: this is definitely not right.  We need to store these closures
+    // per-type and per-descriptor
+    printf("making a copy for monitor\n")
+    self->closure_ptr = three_closure_copy(closure)
+
+    return 1
+  end
+
+  def Monitor.unwatch(Natural registration_ticket)
+  end
 
 end

@@ -39,4 +39,8 @@ namespace Core::Event
     self->registration = shared_monitor.watch(self->type, self->descriptor, closure)
   end
 
+  def Source.cancel()
+    shared_monitor.unwatch(self->registration)
+  end
+
 end
