@@ -22,7 +22,7 @@ namespace Core::Event
 
   public
   def source_create(Core::Event::Type type, Natural descriptor; *Source)
-    // TODO: needs to be a once function
+    # TODO: needs to be a once function
     if shared_monitor == null
       Core::Event::initialize_shared_monitor()
     end
