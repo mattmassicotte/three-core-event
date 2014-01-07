@@ -43,7 +43,7 @@ namespace Core::Event
       # EV_EOF 0x8000
       if ke.data == 0 && ke.flags & 0x8000
         # TODO: It is completely wrong for this thread to exit
-        printf("WARN: kqueue thread exiting\n")
+        printf("ERROR: kqueue thread exiting\n")
         return 1
       end
 
@@ -64,11 +64,18 @@ namespace Core::Event
     loop
       memset(&event, 0, sizeof(epoll_event))
 
-      Int result = epoll_wait(monitor->efd, &event, 1, -1)
+      Int numberFds = epoll_wait(monitor->efd, &event, 1, -1)
 
-      # EPOLLERR or EPOLLHUP
+      if numberFds != 1
+        printf("ERROR: epoll_wait thread exiting\n")
+        return 1
+      end
 
-      
+      printf("woke for event: %x \n", event.events)
+
+      if monitor->closure_ptr
+        #(*monitor->closure_ptr)(event.data.fd, ke.data)
+      end
     end
 
     return 0
