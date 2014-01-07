@@ -5,6 +5,7 @@ include "fcntl.h"
 %if darwin
 include "sys/event.h"
 %else
+include "sys/epoll.h"
 %end
 include "errno.h"
 include "three/c11/threads.h"
@@ -21,8 +22,9 @@ namespace Core::Event
   struct Monitor
     thrd_t thread
 %if darwin
-    Int    kq
+    Int kq
 %else
+    Int efd
 %end
     *{Natural descriptor, Natural data} closure_ptr
   end
@@ -57,6 +59,17 @@ namespace Core::Event
 %else
   def event_thread_entry(*Void arg; Int)
     *Monitor monitor = arg
+    epoll_event event
+
+    loop
+      memset(&event, 0, sizeof(epoll_event))
+
+      Int result = epoll_wait(monitor->efd, &event, 1, -1)
+
+      # EPOLLERR or EPOLLHUP
+
+      
+    end
 
     return 0
   end
@@ -70,6 +83,8 @@ namespace Core::Event
 %if darwin
     monitor->kq = kqueue()
 %else
+    # The zero means we do not need epoll's FD_CLOEXEC feature
+    monitor->efd = epoll_create1(0)
 %end
     monitor->closure_ptr = null
 
@@ -79,15 +94,22 @@ namespace Core::Event
   end
 
   def prepare_descriptor(Natural descriptor)
+%if darwin
     # F_SETFL 4
     # O_NONBLOCK 0x0004
     if fcntl(descriptor, 4, 0x0004) == -1
+%else
+    # for ubuntu
+    # F_SETFL 4
+    # O_NONBLOCK 04000 => 0x800
+    if fcntl(descriptor, 4, 0x800) == -1
+%end
       printf("Unable to make descriptor non-blocking\n")
     end
   end
 
-%if darwin
   def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; Natural)
+%if darwin
     kevent64_s ke
 
     memset(&ke, 0, sizeof(kevent64_s))
@@ -108,6 +130,28 @@ namespace Core::Event
       printf("Unable to arm the event %d\n", (*__error()))
       return 0
     end
+%else
+    epoll_event event
+
+    memset(&event, 0, sizeof(epoll_event))
+
+    # something is broken here...
+    # event.data.fd = descriptor
+    switch type
+    case Core::Event::Type::Read
+      Core::Event::prepare_descriptor(descriptor)
+      event.events = 0x001 # EPOLLIN
+    case Core::Event::Type::Write
+      Core::Event::prepare_descriptor(descriptor)
+      event.events = 0x004 # EPOLLOUT
+    end
+
+    # EPOLL_CTL_ADD 1
+    if epoll_ctl(self->efd, 1, descriptor, &event) == -1
+      printf("Unable to arm the event %d\n", (*__errno_location()))
+      return 0
+    end
+%end
 
     # TODO: this is definitely not right.  We need to store these closures
     # per-type and per-descriptor
@@ -116,11 +160,6 @@ namespace Core::Event
 
     return 1
   end
-%else
-    def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; Natural)
-      return 0
-    end
-%end
 
   def Monitor.unwatch(Natural registration_ticket)
   end
