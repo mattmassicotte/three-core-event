@@ -74,7 +74,9 @@ namespace Core::Event
       printf("woke for event: %x \n", event.events)
 
       if monitor->closure_ptr
-        #(*monitor->closure_ptr)(event.data.fd, ke.data)
+        # epoll doesn't have a way to tell us how much room is available
+        # for read/write operations.  So, for now, just return an arbitrary value.
+        (*monitor->closure_ptr)(event.data.fd, 512)
       end
     end
 
@@ -142,8 +144,7 @@ namespace Core::Event
 
     memset(&event, 0, sizeof(epoll_event))
 
-    # something is broken here...
-    # event.data.fd = descriptor
+    event.data.fd = descriptor
     switch type
     case Core::Event::Type::Read
       Core::Event::prepare_descriptor(descriptor)

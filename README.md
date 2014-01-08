@@ -1,6 +1,6 @@
 ####Three Core Event
 
-Three library that provides abstractions for OS events.  Currently only supports reads on kqueues.
+Three library that provides abstractions for OS events.  Currently supports reads on kqueues and epoll.
 
 ####License
 
