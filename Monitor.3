@@ -26,6 +26,10 @@ namespace Core::Event
 %else
     Int efd
 %end
+    # temporary
+    Natural descriptor
+    Type type
+
     *{Natural descriptor, Natural data} closure_ptr
   end
 
@@ -47,7 +51,7 @@ namespace Core::Event
         return 1
       end
 
-      printf("woke for data: %lld flags: %x\n", ke.data, ke.flags)
+      #printf("woke for data: %lld flags: %x\n", ke.data, ke.flags)
 
       if monitor->closure_ptr
         (*monitor->closure_ptr)(ke.ident, ke.data)
@@ -165,11 +169,37 @@ namespace Core::Event
     # per-type and per-descriptor
     printf("making a copy for monitor\n")
     self->closure_ptr = three_closure_copy(closure)
+    self->descriptor = descriptor
+    self->type = type
 
     return 1
   end
 
   def Monitor.unwatch(Natural registration_ticket)
+%if darwin
+    kevent64_s ke
+
+    memset(&ke, 0, sizeof(kevent64_s))
+
+    ke.ident = self->descriptor
+    switch self->type
+    case Core::Event::Type::Read
+      ke.filter = -1 # EVFILT_READ
+      ke.flags = 0x0002 # EV_DELETE
+    case Core::Event::Type::Write
+      ke.filter = -2 # EVFILT_WRITE
+      ke.flags = 0x0002 # EV_DELETE
+    end
+
+    if kevent64(self->kq, &ke, 1, null, 0, 0, null) == -1
+      printf("Unable to disarm the event for descriptor %d (%d)\n", self->descriptor, (*__error()))
+      return
+    end
+%else
+    return
+%end
+
+  printf("Disarmed event for descriptor %d\n", self->descriptor)
   end
 
 end
