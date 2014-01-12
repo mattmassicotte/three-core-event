@@ -11,10 +11,13 @@ include "errno.h"
 include "three/c11/threads.h"
 include "three/runtime/closure.h" # this should not be necessary
 
+import Core::Collection::LinkedList
+
 namespace Core::Event
 
   public
   enum Type
+    Unknown
     Read
     Write
   end
@@ -26,26 +29,58 @@ namespace Core::Event
 %else
     Int efd
 %end
-    # temporary
-    Natural descriptor
-    Type type
-
-    *{Natural descriptor, Natural data} closure_ptr
+    *Core::Collection::LinkedList registration_list
   end
 
   private
-%if darwin
+  struct Registration
+    Natural descriptor
+    Type type
+    *{Natural descriptor, Natural data} closure_ptr
+  end
+
+  def Monitor.enumerate_registrations({*Registration reg; Bool} closure)
+    self->registration_list.enumerate(do (*Core::Collection::LinkedListNode node; Bool) {
+      *Registration reg = node.get_value()
+
+      return closure(reg)
+    })
+  end
+
+  def Monitor.deliver_event(Type type, Natural descriptor, Natural data)
+    # deliver the event to all matching registrations
+    self.enumerate_registrations(do (*Registration reg; Bool) {
+      if reg->type == type && reg->descriptor == descriptor
+        printf("[Event::Monitor] received event for %p\n", reg)
+        (*reg->closure_ptr)(descriptor, data)
+      end
+
+      return true
+    })
+  end
+
+  def opposite_type(Type type; Type)
+    switch type
+    case Core::Event::Type::Read
+      return Core::Event::Type::Write
+    case Core::Event::Type::Write
+      return Core::Event::Type::Read
+    end
+
+    return Core::Event::Type::Unknown
+  end
+
   def event_thread_entry(*Void arg; Int)
     *Monitor monitor = arg
-    kevent64_s ke
-
+%if darwin
     loop
+      kevent64_s ke
+
       memset(&ke, 0, sizeof(kevent64_s))
 
       Int result = kevent64(monitor->kq, null, 0, &ke, 1, 0, null)
 
-      # EV_EOF 0x8000
-      if ke.data == 0 && ke.flags & 0x8000
+      if ke.data == 0 && ke.flags & EV_EOF
         # TODO: It is completely wrong for this thread to exit
         printf("ERROR: kqueue thread exiting\n")
         return 1
@@ -53,19 +88,18 @@ namespace Core::Event
 
       #printf("woke for data: %lld flags: %x\n", ke.data, ke.flags)
 
-      if monitor->closure_ptr
-        (*monitor->closure_ptr)(ke.ident, ke.data)
+      if ke.filter == EVFILT_READ
+        monitor.deliver_event(Core::Event::Type::Read, ke.ident, ke.data)
+      end
+
+      if ke.filter == EVFILT_WRITE
+        monitor.deliver_event(Core::Event::Type::Write, ke.ident, ke.data)
       end
     end
-
-    return 0
-  end
 %else
-  def event_thread_entry(*Void arg; Int)
-    *Monitor monitor = arg
-    epoll_event event
-
     loop
+      epoll_event event
+
       memset(&event, 0, sizeof(epoll_event))
 
       Int numberFds = epoll_wait(monitor->efd, &event, 1, -1)
@@ -75,18 +109,21 @@ namespace Core::Event
         return 1
       end
 
-      printf("woke for event: %x \n", event.events)
+      #printf("woke for event: %x \n", event.events)
 
-      if monitor->closure_ptr
-        # epoll doesn't have a way to tell us how much room is available
-        # for read/write operations.  So, for now, just return an arbitrary value.
-        (*monitor->closure_ptr)(event.data.fd, 512)
+      # epoll doesn't have a way to tell us how much room is available
+      # for read/write operations.  So, for now, just return an arbitrary value.
+      if event.events & EPOLLIN
+        monitor.deliver_event(Core::Event::Type::Read, event.data.fd, 4096)
+      end
+
+      if event.events & EPOLLOUT
+        monitor.deliver_event(Core::Event::Type::Write, event.data.fd, 4096)
       end
     end
-
+%end
     return 0
   end
-%end
 
   public
   def monitor_create(; *Monitor)
@@ -99,107 +136,230 @@ namespace Core::Event
     # The zero means we do not need epoll's FD_CLOEXEC feature
     monitor->efd = epoll_create1(0)
 %end
-    monitor->closure_ptr = null
+
+    monitor->registration_list = Core::Collection::linked_list_create()
 
     thrd_create(&monitor->thread, Core::Event::event_thread_entry, monitor)
 
     return monitor
   end
 
-  def prepare_descriptor(Natural descriptor)
-%if darwin
-    # F_SETFL 4
-    # O_NONBLOCK 0x0004
-    if fcntl(descriptor, 4, 0x0004) == -1
-%else
-    # for ubuntu
-    # F_SETFL 4
-    # O_NONBLOCK 04000 => 0x800
-    if fcntl(descriptor, 4, 0x800) == -1
-%end
-      printf("Unable to make descriptor non-blocking\n")
-    end
+  private
+  def prepare_descriptor(Natural descriptor; Bool)
+    return fcntl(descriptor, F_SETFL, O_NONBLOCK) != -1
   end
 
-  def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; Natural)
+  def Monitor.register_callback(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; *Void)
+    *Core::Collection::LinkedListNode node
+
+    printf("[Event::Monitor] registering monitor callback\n")
+
+    node = self->registration_list.find(do (*Core::Collection::LinkedListNode node; Bool) {
+      *Registration reg = node.get_value()
+
+      return reg->type == type && reg->descriptor == descriptor
+    })
+
+    if node
+      printf("[Event::Monitor] already registered (%d, %d)\n", descriptor, type)
+      return node.get_value()
+    end
+
+    *Registration registration = malloc(sizeof(Registration))
+    registration->type = type
+    registration->descriptor = descriptor
+    registration->closure_ptr = three_closure_copy(closure)
+
+    node = Core::Collection::linked_list_node_create(registration)
+
+    printf("[Event::Monitor] registration %p for (%d, %d)\n", registration, descriptor, type)
+    self->registration_list.add(node)
+
+    return registration
+  end
+
+  def Monitor.deregister(*Registration registration; Bool)
+    *Core::Collection::LinkedListNode node
+
+    printf("[Event::Monitor] deregistering monitor callback\n")
+
+    node = self->registration_list.find(do (*Core::Collection::LinkedListNode node; Bool) {
+      return registration == node.get_value()
+    })
+
+    if node == null
+      printf("[Event::Monitor] unable to find matching registration\n")
+      return false
+    end
+
+    return self->registration_list.remove(node)
+  end
+
 %if darwin
+  def kqueue_type_to_filter(Type type; Int)
+    switch type
+    case Core::Event::Type::Read
+      return EVFILT_READ
+    case Core::Event::Type::Write
+      return EVFILT_WRITE
+    end
+
+    return 0
+  end
+
+  def Monitor.kqueue_register(Type type, Natural descriptor; Bool)
     kevent64_s ke
 
     memset(&ke, 0, sizeof(kevent64_s))
 
     ke.ident = descriptor
-    switch type
-    case Core::Event::Type::Read
-      Core::Event::prepare_descriptor(descriptor)
-      ke.filter = -1 # EVFILT_READ
-      ke.flags = 0x0001 | 0x0004 # EV_ADD | EV_ENABLE
-    case Core::Event::Type::Write
-      Core::Event::prepare_descriptor(descriptor)
-      ke.filter = -2 # EVFILT_WRITE
-      ke.flags = 0x0001 | 0x0004 # EV_ADD | EV_ENABLE
-    end
+    ke.filter = Core::Event::kqueue_type_to_filter(type)
+    ke.flags = EV_ADD | EV_ENABLE
+
+    Core::Event::prepare_descriptor(descriptor)
+
+    return kevent64(self->kq, &ke, 1, null, 0, 0, null) != -1
+  end
+
+  def Monitor.kqueue_deregister(Type type, Natural descriptor; Bool)
+    kevent64_s ke
+
+    memset(&ke, 0, sizeof(kevent64_s))
+
+    ke.ident = descriptor
+    ke.filter = Core::Event::kqueue_type_to_filter(type)
+    ke.flags = EV_DELETE
 
     if kevent64(self->kq, &ke, 1, null, 0, 0, null) == -1
-      printf("Unable to arm the event %d\n", (*__error()))
-      return 0
+      printf("[Event::Monitor] Unable to disarm the event for (%d, %d) (%d)\n", descriptor, type, errno)
+      return false
     end
+
+    return true
+  end
 %else
+  def epoll_type_to_events_mask(Type type; Int)
+    switch type
+    case Core::Event::Type::Read
+      return EPOLLIN
+    case Core::Event::Type::Write
+      return EPOLLOUT
+    end
+  end
+
+  def Monitor.epoll_existing_events(Natural descriptor; Natural)
+    Natural existing_epoll_events = 0
+
+    self.enumerate_registrations(do (*Registration reg; Bool; existing_epoll_events) {
+      # if we find a match on this descriptor, set the corresponding event bit
+      if reg->descriptor == descriptor
+        existing_epoll_events = existing_epoll_events | Core::Event::epoll_type_to_events_mask(reg->type)
+      end
+
+      # stop scanning if both bits are set
+      return existing_epoll_events != (EPOLLIN | EPOLLOUT)
+    })
+
+    return existing_epoll_events
+  end
+
+  def Monitor.epoll_ctl(Natural ctl_op, Natural descriptor, Natural events; Bool)
+    return true if ctl_op == 0
+
     epoll_event event
 
     memset(&event, 0, sizeof(epoll_event))
 
     event.data.fd = descriptor
-    switch type
-    case Core::Event::Type::Read
-      Core::Event::prepare_descriptor(descriptor)
-      event.events = 0x001 # EPOLLIN
-    case Core::Event::Type::Write
-      Core::Event::prepare_descriptor(descriptor)
-      event.events = 0x004 # EPOLLOUT
+    event.events = events
+
+    if epoll_ctl(self->efd, ctl_op, descriptor, &event) == -1
+      printf("[Event::Monitor] Unable to arm the event %d\n", errno)
+      return false
     end
 
-    # EPOLL_CTL_ADD 1
-    if epoll_ctl(self->efd, 1, descriptor, &event) == -1
-      printf("Unable to arm the event %d\n", (*__errno_location()))
-      return 0
-    end
+    return true
+  end
 %end
 
-    # TODO: this is definitely not right.  We need to store these closures
-    # per-type and per-descriptor
-    printf("making a copy for monitor\n")
-    self->closure_ptr = three_closure_copy(closure)
-    self->descriptor = descriptor
-    self->type = type
-
-    return 1
-  end
-
-  def Monitor.unwatch(Natural registration_ticket)
+  public
+  def Monitor.watch(Type type, Natural descriptor, {Natural descriptor, Natural data} closure; *Void)
 %if darwin
-    kevent64_s ke
-
-    memset(&ke, 0, sizeof(kevent64_s))
-
-    ke.ident = self->descriptor
-    switch self->type
-    case Core::Event::Type::Read
-      ke.filter = -1 # EVFILT_READ
-      ke.flags = 0x0002 # EV_DELETE
-    case Core::Event::Type::Write
-      ke.filter = -2 # EVFILT_WRITE
-      ke.flags = 0x0002 # EV_DELETE
+    if Core::Event::prepare_descriptor(descriptor) == false
+      printf("[Event::Monitor] Unable prepare descriptor\n")
+      return null
     end
 
-    if kevent64(self->kq, &ke, 1, null, 0, 0, null) == -1
-      printf("Unable to disarm the event for descriptor %d (%d)\n", self->descriptor, (*__error()))
-      return
+    if self.kqueue_register(type, descriptor) == false
+      printf("[Event::Monitor] Unable to arm the event %d\n", errno)
+      return null
     end
 %else
-    return
+    Natural existing_epoll_events = self.epoll_existing_events(descriptor)
+    Natural ctl_op = 0
+    Natural epoll_event = Core::Event::epoll_type_to_events_mask(type)
+
+    switch existing_epoll_events
+    case 0 # nothing exists yet, we do a simple add
+      ctl_op = EPOLL_CTL_ADD
+      Core::Event::prepare_descriptor(descriptor)
+    case epoll_event # already have a registration for this event type
+      ctl_op = 0
+    case Core::Event::epoll_type_to_events_mask(Core::Event::opposite_type(type))
+      # we've got the opposite type set, so we need to do a modify
+      ctl_op = EPOLL_CTL_MOD
+      epoll_event = EPOLLIN | EPOLLOUT
+      printf("[Event::Monitor] moding existing descriptor %d\n", descriptor)
+    case EPOLLIN | EPOLLOUT
+      # both are set, nothing to do but record the new registration
+      ctl_op = 0
+    end
+
+    self.epoll_ctl(ctl_op, descriptor, epoll_event)
 %end
 
-  printf("Disarmed event for descriptor %d\n", self->descriptor)
+    return self.register_callback(type, descriptor, closure)
+  end
+
+  def Monitor.unwatch(*Void registration_ptr)
+    *Registration registration = registration_ptr
+
+    if self.deregister(registration) == false
+      return
+    end
+
+%if darwin
+    # for kqueues we need to simply delete the event from the kqueue
+    self.kqueue_deregister(registration->type, registration->descriptor)
+%else
+    # for epoll, we've got to:
+    # - check to see if there are existing registrations
+    # - if we find none, delete the event
+    # - if we find only the opposite type, mod the event
+    # - if we find both, leave it alone
+    Natural existing_epoll_events = self.epoll_existing_events(registration->descriptor)
+    Natural ctl_op = 0
+    Natural epoll_event = Core::Event::epoll_type_to_events_mask(registration->type)
+
+    switch existing_epoll_events
+    case 0 # none, we can do a delete
+      ctl_op = EPOLL_CTL_DEL
+    case epoll_event # another registration exists for this type
+      ctl_op = 0
+    case Core::Event::epoll_type_to_events_mask(Core::Event::opposite_type(registration->type))
+      # we've got the opposite type set, so we need to do a modify
+      ctl_op = EPOLL_CTL_MOD
+      epoll_event = Core::Event::epoll_type_to_events_mask(Core::Event::opposite_type(registration->type))
+      printf("[Event::Monitor] moding existing descriptor %d\n", registration->descriptor)
+    case EPOLLIN | EPOLLOUT
+      # both are set, nothing to do
+      ctl_op = 0
+    end
+
+    self.epoll_ctl(ctl_op, registration->descriptor, epoll_event)
+%end
+
+    printf("[Event::Monitor] Disarmed event for descriptor %d\n", registration->descriptor)
   end
 
 end
