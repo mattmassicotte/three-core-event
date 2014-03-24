@@ -8,9 +8,11 @@ include "sys/event.h"
 include "sys/epoll.h"
 %end
 include "errno.h"
-include "three/c11/threads.h"
-include "three/runtime/closure.h" # this should not be necessary
 
+public
+include "three/c11/threads.h"
+
+private
 import Core::Collection::LinkedList
 
 namespace Core::Event
